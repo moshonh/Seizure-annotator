@@ -18,6 +18,8 @@ cd seizure_annotator
 pip install -r requirements.txt
 ```
 
+> **Note**: The package uses `opencv-python-headless` (no GUI dependencies) which is compatible with all environments including Streamlit Cloud and Python 3.14+.
+
 ### 3. Run the app
 
 ```cmd
