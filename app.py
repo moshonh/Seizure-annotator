@@ -349,179 +349,205 @@ def derive_ml_features(ann: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# PATIENT DETECTION OVERLAY (OpenCV — no download required)
+# PATIENT DETECTION OVERLAY
+# Multi-cascade: fullbody → upperbody → face → eyes
+# All models built into OpenCV — zero downloads
 # ══════════════════════════════════════════════════════════
 
 class GazeOverlay:
     """
-    Patient detection overlay using OpenCV Haar cascades.
-    Detects: face, eyes, gaze direction estimate.
-    No model download required — uses cascades built into opencv.
+    Multi-stage patient detection using OpenCV built-in Haar cascades.
+    Strategy:
+      1. Full body detection  → locates patient in frame
+      2. Upper body detection → narrows to torso/head region  
+      3. Face detection (frontal + profile) → head location
+      4. Eye detection + iris → gaze direction estimate
+    Works even when face is bandaged / partially occluded.
+    Zero downloads — all cascades bundled with opencv-python-headless.
     """
 
     def __init__(self):
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.eye_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_eye.xml')
-        self.left_eye_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_lefteye_2splits.xml')
-        self.right_eye_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_righteye_2splits.xml')
-        self._prev_gaze_x = 0.5
-        print("Patient detection overlay loaded (OpenCV Haar cascades)")
+        data = cv2.data.haarcascades
+        self.face_f   = cv2.CascadeClassifier(data + 'haarcascade_frontalface_default.xml')
+        self.face_p   = cv2.CascadeClassifier(data + 'haarcascade_profileface.xml')
+        self.face_alt = cv2.CascadeClassifier(data + 'haarcascade_frontalface_alt2.xml')
+        self.upper    = cv2.CascadeClassifier(data + 'haarcascade_upperbody.xml')
+        self.full     = cv2.CascadeClassifier(data + 'haarcascade_fullbody.xml')
+        self.eye      = cv2.CascadeClassifier(data + 'haarcascade_eye.xml')
+        self.leye     = cv2.CascadeClassifier(data + 'haarcascade_lefteye_2splits.xml')
+        self.reye     = cv2.CascadeClassifier(data + 'haarcascade_righteye_2splits.xml')
+        self._history = {"body": None, "face": None, "gaze": 0.0}
+        print("Patient detection overlay ready (OpenCV multi-cascade)")
 
-    def _estimate_iris(self, eye_roi_gray):
-        """Estimate iris center using thresholding + contours."""
-        if eye_roi_gray.size == 0:
+    def _detect_any(self, gray, cascades, scale=1.1, neighbors=3, min_size=(40,40)):
+        """Run multiple cascades, return largest detection."""
+        best = None
+        for cas in cascades:
+            dets = cas.detectMultiScale(gray, scaleFactor=scale,
+                                        minNeighbors=neighbors, minSize=min_size)
+            for d in dets:
+                if best is None or d[2]*d[3] > best[2]*best[3]:
+                    best = d
+        return best
+
+    def _iris_center(self, eye_gray):
+        """Locate iris/pupil via thresholding."""
+        if eye_gray.size < 100:
             return None
-        # Blur and threshold to find darkest region (pupil/iris)
-        blurred = cv2.GaussianBlur(eye_roi_gray, (7, 7), 0)
-        _, thresh = cv2.threshold(blurred, 50, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        blur = cv2.GaussianBlur(eye_gray, (7,7), 0)
+        # Adaptive threshold — works under different lighting
+        _, th = cv2.threshold(blur, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
             return None
-        # Largest contour = iris
-        c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) < 10:
+        c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(c) < 8:
             return None
         M = cv2.moments(c)
         if M["m00"] == 0:
             return None
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        return (cx, cy)
-
-    def _gaze_direction(self, eye_roi_gray, eye_rect):
-        """Estimate gaze: left/center/right + deviation score."""
-        iris = self._estimate_iris(eye_roi_gray)
-        if iris is None:
-            return "unknown", 0.0
-        h, w = eye_roi_gray.shape
-        rel_x = iris[0] / w  # 0=left edge, 1=right edge
-        if rel_x < 0.35:
-            direction = "LEFT"
-        elif rel_x > 0.65:
-            direction = "RIGHT"
-        else:
-            direction = "CENTER"
-        deviation = (rel_x - 0.5) * 2  # -1 to +1
-        return direction, deviation
+        return int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
 
     def process_frame(self, frame_rgb: np.ndarray) -> dict:
         h, w = frame_rgb.shape[:2]
-        annotated = frame_rgb.copy()
+        out = frame_rgb.copy()
         gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        # Equalize histogram → better detection under uneven lighting
+        gray_eq = cv2.equalizeHist(gray)
 
-        gaze_info = {
+        info = {
+            "patient_detected": False,
             "face_detected": False,
             "n_eyes": 0,
             "gaze_direction": "unknown",
             "deviation_x": 0.0,
             "in_frame": True,
-            "x": 0.5,
-            "y": 0.5,
+            "x": 0.5, "y": 0.5,
         }
 
-        # ── Detect face ──────────────────────────────────────
-        faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        # ── Stage 1: locate patient body ────────────────────
+        body = self._detect_any(gray_eq,
+                                [self.full, self.upper],
+                                scale=1.05, neighbors=2, min_size=(60,60))
 
-        if len(faces) == 0:
-            # Try profile face
-            faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
+        if body is not None:
+            bx, by, bw, bh = body
+            info["patient_detected"] = True
+            info["x"] = (bx + bw/2) / w
+            info["y"] = (by + bh/2) / h
+            self._history["body"] = body
+            # Draw body box
+            cv2.rectangle(out, (bx,by), (bx+bw,by+bh), (88,200,100), 2)
+            cv2.putText(out, "PATIENT", (bx, by-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (88,200,100), 1)
+            # Search for face in upper 60% of body ROI
+            search_y1 = by
+            search_y2 = by + int(bh * 0.6)
+            search_x1 = bx
+            search_x2 = bx + bw
+        else:
+            # Fall back to full frame search
+            search_y1, search_y2 = 0, h
+            search_x1, search_x2 = 0, w
 
-        if len(faces) > 0:
-            # Use largest face
-            fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-            gaze_info["face_detected"] = True
-            gaze_info["x"] = (fx + fw / 2) / w
-            gaze_info["y"] = (fy + fh / 2) / h
+        # ── Stage 2: face detection in search region ─────────
+        roi_gray = gray_eq[search_y1:search_y2, search_x1:search_x2]
+        face = self._detect_any(roi_gray,
+                                [self.face_f, self.face_alt, self.face_p],
+                                scale=1.08, neighbors=3, min_size=(30,30))
 
-            # Draw face box
-            cv2.rectangle(annotated, (fx, fy), (fx+fw, fy+fh),
-                          (88, 200, 100), 2)
-            cv2.putText(annotated, "PATIENT", (fx, fy - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 200, 100), 1)
+        if face is not None:
+            fx, fy, fw, fh = face
+            # Translate back to full frame coords
+            fx += search_x1; fy += search_y1
+            info["face_detected"] = True
+            info["patient_detected"] = True
+            info["x"] = (fx + fw/2) / w
+            info["y"] = (fy + fh/2) / h
+            self._history["face"] = (fx, fy, fw, fh)
 
-            # ── Detect eyes within face ROI ──────────────────
+            cv2.rectangle(out, (fx,fy), (fx+fw,fy+fh), (255,200,50), 2)
+            cv2.putText(out, "FACE", (fx, fy-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,200,50), 1)
+
+            # ── Stage 3: eye detection ────────────────────────
             face_gray = gray[fy:fy+fh, fx:fx+fw]
-            face_rgb_roi = annotated[fy:fy+fh, fx:fx+fw]
+            upper_face = face_gray[:int(fh*0.55), :]
 
-            # Use upper half of face for eyes
-            upper = face_gray[:fh//2, :]
-            eyes = self.eye_cascade.detectMultiScale(
-                upper, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
+            eyes = self.eye.detectMultiScale(upper_face, 1.08, 3, minSize=(15,15))
+            if len(eyes) == 0:
+                # Try left/right eye cascades
+                leyes = self.leye.detectMultiScale(upper_face, 1.08, 2, minSize=(12,12))
+                reyes = self.reye.detectMultiScale(upper_face, 1.08, 2, minSize=(12,12))
+                eyes = list(leyes) + list(reyes)
 
-            gaze_info["n_eyes"] = len(eyes)
+            info["n_eyes"] = len(eyes)
             deviations = []
 
-            for (ex, ey, ew, eh) in eyes[:2]:
+            for (ex, ey, ew, eh) in list(eyes)[:2]:
                 # Draw eye box
-                cv2.rectangle(face_rgb_roi,
-                              (ex, ey), (ex+ew, ey+eh),
-                              (88, 166, 255), 1)
-
-                # Iris detection
-                eye_gray = upper[ey:ey+eh, ex:ex+ew]
-                iris = self._estimate_iris(eye_gray)
+                abs_ex, abs_ey = fx+ex, fy+ey
+                cv2.rectangle(out, (abs_ex,abs_ey),
+                              (abs_ex+ew,abs_ey+eh), (88,166,255), 1)
+                # Iris
+                eye_roi = gray[abs_ey:abs_ey+eh, abs_ex:abs_ex+ew]
+                iris = self._iris_center(eye_roi)
                 if iris is not None:
-                    ix_abs = fx + ex + iris[0]
-                    iy_abs = fy + ey + iris[1]
-                    cv2.circle(annotated, (ix_abs, iy_abs), 4, (255, 220, 50), -1)
-                    # Deviation
-                    dev = (iris[0] / ew - 0.5) * 2
+                    ix, iy = abs_ex+iris[0], abs_ey+iris[1]
+                    cv2.circle(out, (ix,iy), 4, (255,220,50), -1)
+                    dev = (iris[0]/ew - 0.5) * 2
                     deviations.append(dev)
 
             if deviations:
                 mean_dev = float(np.mean(deviations))
-                gaze_info["deviation_x"] = mean_dev
-                if mean_dev < -0.3:
-                    gaze_info["gaze_direction"] = "LEFT"
-                elif mean_dev > 0.3:
-                    gaze_info["gaze_direction"] = "RIGHT"
+                info["deviation_x"] = mean_dev
+                self._history["gaze"] = mean_dev
+                if mean_dev < -0.25:
+                    info["gaze_direction"] = "LEFT"
+                elif mean_dev > 0.25:
+                    info["gaze_direction"] = "RIGHT"
                 else:
-                    gaze_info["gaze_direction"] = "CENTER"
-                self._prev_gaze_x = mean_dev
+                    info["gaze_direction"] = "CENTER"
 
-        # ── HUD overlay ──────────────────────────────────────
-        face_str  = "FACE: ✓" if gaze_info["face_detected"] else "FACE: ✗"
-        eyes_str  = f"EYES: {gaze_info['n_eyes']}"
-        gaze_str  = f"GAZE: {gaze_info['gaze_direction']}"
-        dev_str   = f"DEV: {gaze_info['deviation_x']:+.2f}"
+        elif self._history["face"] is not None:
+            # Use last known face position (smoothing)
+            fx, fy, fw, fh = self._history["face"]
+            cv2.rectangle(out, (fx,fy), (fx+fw,fy+fh), (255,200,50,128), 1)
 
-        face_col = (88, 200, 100) if gaze_info["face_detected"] else (247, 129, 102)
-        eye_col  = (88, 166, 255) if gaze_info["n_eyes"] > 0 else (247, 129, 102)
-        gaze_col = (255, 220, 50)
+        # ── HUD bar ──────────────────────────────────────────
+        hud = out.copy()
+        cv2.rectangle(hud, (0,0), (w,38), (0,0,0), -1)
+        out = cv2.addWeighted(hud, 0.55, out, 0.45, 0)
 
-        # Semi-transparent HUD bar
-        overlay = annotated.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 36), (0, 0, 0), -1)
-        annotated = cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0)
+        p_col = (88,200,100) if info["patient_detected"] else (247,129,102)
+        f_col = (255,200,50) if info["face_detected"] else (150,150,150)
+        e_col = (88,166,255) if info["n_eyes"]>0 else (150,150,150)
+        g_col = (255,220,50)
 
-        cv2.putText(annotated, face_str, (8,  24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_col, 1)
-        cv2.putText(annotated, eyes_str, (120, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, eye_col,  1)
-        cv2.putText(annotated, gaze_str, (210, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gaze_col, 1)
-        cv2.putText(annotated, dev_str,  (330, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gaze_col, 1)
+        labels = [
+            (f"PATIENT:{'✓' if info['patient_detected'] else '✗'}", 8,  p_col),
+            (f"FACE:{'✓' if info['face_detected'] else '✗'}",        160, f_col),
+            (f"EYES:{info['n_eyes']}",                                280, e_col),
+            (f"GAZE:{info['gaze_direction']}",                        370, g_col),
+            (f"DEV:{info['deviation_x']:+.2f}",                       510, g_col),
+        ]
+        for txt, x, col in labels:
+            cv2.putText(out, txt, (x,26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 1)
 
-        # Gaze deviation arrow from center
-        if gaze_info["face_detected"] and gaze_info["n_eyes"] > 0:
-            cx = w // 2
-            cy = 50
-            arrow_len = int(gaze_info["deviation_x"] * 80)
-            cv2.arrowedLine(annotated, (cx, cy), (cx + arrow_len, cy),
-                            gaze_col, 2, tipLength=0.3)
+        # Gaze deviation arrow
+        if info["patient_detected"]:
+            cx = w//2
+            arrow_end = cx + int(info["deviation_x"] * 70)
+            cv2.arrowedLine(out, (cx,52), (arrow_end,52), g_col, 2, tipLength=0.3)
 
-        return {"frame": annotated, "gaze_info": gaze_info}
+        return {"frame": out, "gaze_info": info}
 
 
 class MockGazeOverlay:
     def __init__(self):
-        self._frame_count = 0
-
+        pass
     def process_frame(self, frame_rgb):
-        self._frame_count += 1
         return {"frame": frame_rgb, "gaze_info": {}}
 
 # ══════════════════════════════════════════════════════════
