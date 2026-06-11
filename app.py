@@ -2,23 +2,552 @@
 NeuroAnnotate — Ictal Semiology Annotation Tool
 Rambam Medical Center Epilepsy Service
 Based on: Beniczky et al., ILAE Glossary of Seizure Semiology, Epileptic Disorders 2022
+Single-file version (no external utils dependencies)
 """
+
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import streamlit as st
 import cv2
 import numpy as np
 import json
-import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
 import base64
-from utils.ilae_schema import ILAE_SCHEMA
-from utils.json_export import build_annotation_record
-from utils.gaze_overlay import GazeOverlay
 
+# ══════════════════════════════════════════════════════════
+# ILAE SCHEMA (Beniczky et al. 2022)
+# ══════════════════════════════════════════════════════════
+ILAE_SCHEMA = {
+
+    "consciousness": {
+        "label": "Consciousness & Responsiveness",
+        "icon": "👁",
+        "expanded": True,
+        "fields": [
+            {"key": "awareness_intact",    "label": "Awareness intact",          "type": "checkbox", "note": "Patient later verifies retained awareness"},
+            {"key": "awareness_impaired",  "label": "Awareness impaired",        "type": "checkbox", "note": "Unable to later verify retained awareness"},
+            {"key": "responsive",          "label": "Responsive to commands",    "type": "checkbox"},
+            {"key": "partially_responsive","label": "Partially responsive",      "type": "checkbox", "note": "Inconsistent or prolonged reaction time"},
+            {"key": "non_responsive",      "label": "Non-responsive",            "type": "checkbox"},
+            {"key": "behavioral_arrest",   "label": "Behavioral / Motor arrest", "type": "checkbox"},
+        ]
+    },
+
+    "elementary_motor": {
+        "label": "Elementary Motor Signs",
+        "icon": "⚡",
+        "expanded": True,
+        "fields": [
+            {"key": "akinetic",       "label": "Akinetic (negative motor)",  "type": "checkbox", "lateralizable": True,  "note": "Mesial premotor / inferior frontal"},
+            {"key": "atonic",         "label": "Atonic",                     "type": "checkbox", "lateralizable": True},
+            {"key": "myoclonic",      "label": "Myoclonic",                  "type": "checkbox", "lateralizable": True,  "note": "Contralateral → frontal/motor cortex"},
+            {"key": "clonic",         "label": "Clonic (rhythmic)",          "type": "checkbox", "lateralizable": True,  "note": "Contralateral hemisphere ~90%"},
+            {"key": "myoclonic_atonic","label": "Myoclonic-atonic",          "type": "checkbox"},
+            {"key": "epileptic_spasm", "label": "Epileptic spasm",           "type": "checkbox", "lateralizable": True},
+            {"key": "eye_blinking",   "label": "Ictal eye blinking",         "type": "checkbox", "lateralizable": True,  "note": "IPSI when unilateral"},
+            {"key": "tonic_unilateral","label": "Tonic — unilateral",        "type": "checkbox", "lateralizable": True,  "note": "Contralateral ~90%"},
+            {"key": "tonic_bilateral_sym","label":"Tonic — bilateral symmetric","type":"checkbox"},
+            {"key": "tonic_bilateral_asym","label":"Tonic — bilateral asymmetric","type":"checkbox"},
+            {"key": "chapeau_gendarme","label":"Chapeau de gendarme (ictal pouting)","type":"checkbox", "note": "Frontal: anterior prefrontal / anterior cingulate"},
+            {"key": "fencing_posture","label": "Fencing posture (M2e)",      "type": "checkbox", "lateralizable": True,  "note": "CON → supplementary motor area (mesial frontal)"},
+            {"key": "tonic_clonic",   "label": "Tonic-clonic",               "type": "checkbox", "lateralizable": True},
+            {"key": "figure_of_four", "label": "Figure-of-4 sign",           "type": "checkbox", "lateralizable": True,  "note": "Extended arm = CON hemisphere"},
+            {"key": "asymm_clonic_ending","label":"Asymmetric clonic ending", "type": "checkbox", "lateralizable": True,  "note": "Last jerks IPSI to onset"},
+            {"key": "versive",        "label": "Versive (forced sustained)",  "type": "checkbox", "lateralizable": True,  "note": "CON when followed by FBTC"},
+            {"key": "head_orientation","label":"Head orientation (non-versive)","type":"checkbox", "lateralizable": True,  "note": "IPSI early in TLE"},
+            {"key": "gyratory",       "label": "Gyratory",                   "type": "checkbox", "lateralizable": True,  "note": "CON when head version precedes"},
+            {"key": "epileptic_nystagmus","label":"Epileptic nystagmus",     "type": "checkbox", "lateralizable": True,  "note": "Fast phase CON → occipital"},
+            {"key": "ictal_paresis",  "label": "Ictal paresis",              "type": "checkbox", "lateralizable": True,  "note": "CON → motor cortex"},
+            {"key": "dystonic_posturing","label":"Dystonic posturing",        "type": "checkbox", "lateralizable": True,  "note": "CON when unilateral (mainly TLE)"},
+        ]
+    },
+
+    "complex_motor": {
+        "label": "Complex Motor / Automatisms",
+        "icon": "🤲",
+        "expanded": False,
+        "fields": [
+            {"key": "automatisms_oral",     "label": "Oro-alimentary automatisms (chewing, lip smacking)", "type": "checkbox", "note": "Temporal mesial / insulo-opercular"},
+            {"key": "automatisms_distal",   "label": "Gestural automatisms — distal (hand/finger)", "type": "checkbox", "lateralizable": True, "note": "IPSI in TLE context"},
+            {"key": "automatisms_proximal", "label": "Gestural automatisms — proximal (arm/leg)", "type": "checkbox"},
+            {"key": "automatisms_genital",  "label": "Genital automatisms",   "type": "checkbox", "lateralizable": True, "note": "IPSI → non-dominant temporal"},
+            {"key": "automatisms_mimic_gelastic","label":"Mimic — gelastic (laughing)","type":"checkbox","note":"Hypothalamic hamartoma if isolated/clusters"},
+            {"key": "automatisms_mimic_dacrystic","label":"Mimic — dacrystic (crying)","type":"checkbox"},
+            {"key": "automatisms_verbal",   "label": "Verbal automatisms",    "type": "checkbox", "note": "Temporal / insulo-opercular"},
+            {"key": "automatisms_vocal",    "label": "Vocal automatisms (grunts, shrieks)", "type": "checkbox"},
+            {"key": "hyperkinetic",         "label": "Hyperkinetic / Hypermotor behaviour", "type": "checkbox", "note": "Frontal (esp. orbitofrontal / ACC)"},
+            {"key": "ictal_grasping",       "label": "Ictal grasping",        "type": "checkbox", "note": "Anterior cingulate"},
+        ]
+    },
+
+    "oculomotor": {
+        "label": "Oculomotor / Gaze",
+        "icon": "👀",
+        "expanded": True,
+        "fields": [
+            {"key": "gaze_deviation",       "label": "Ictal gaze deviation",  "type": "checkbox", "lateralizable": True, "note": "CON to onset focus (frontal/temporal)"},
+            {"key": "gaze_aversion",        "label": "Gaze aversion / avoidance", "type": "checkbox"},
+            {"key": "eyes_open_fixed",      "label": "Eyes open, fixed stare", "type": "checkbox"},
+            {"key": "eye_closure_forceful", "label": "Forceful eye closure",   "type": "checkbox", "note": "High specificity for PNES"},
+            {"key": "eye_closure_flutter",  "label": "Eye flutter / eyelid myoclonia", "type": "checkbox"},
+            {"key": "eye_closure_subtle",   "label": "Subtle eye closure",     "type": "checkbox"},
+            {"key": "upward_gaze",          "label": "Upward gaze deviation",  "type": "checkbox"},
+        ]
+    },
+
+    "pnes_features": {
+        "label": "PNES Suggestive Features",
+        "icon": "🔴",
+        "expanded": False,
+        "fields": [
+            {"key": "pnes_gradual_onset",   "label": "Gradual onset (>30s ramp-up)",       "type": "checkbox"},
+            {"key": "pnes_prolonged",       "label": "Prolonged duration (>5 min)",         "type": "checkbox"},
+            {"key": "pnes_waxing_waning",   "label": "Waxing and waning course",            "type": "checkbox"},
+            {"key": "pnes_eye_closure",     "label": "Forceful / sustained eye closure",    "type": "checkbox", "note": "Strong PNES marker"},
+            {"key": "pnes_pelvic_thrust",   "label": "Pelvic thrusting",                    "type": "checkbox"},
+            {"key": "pnes_opisthotonus",    "label": "Opisthotonus / arc-en-ciel",          "type": "checkbox"},
+            {"key": "pnes_preserved_awareness","label":"Preserved awareness with motor activity","type":"checkbox"},
+            {"key": "pnes_side_to_side",    "label": "Side-to-side head movement",         "type": "checkbox"},
+            {"key": "pnes_stuttering",      "label": "Ictal stuttering / crying",           "type": "checkbox"},
+            {"key": "pnes_asynchronous",    "label": "Asynchronous limb movements",        "type": "checkbox"},
+        ]
+    },
+
+    "autonomic": {
+        "label": "Autonomic Phenomena",
+        "icon": "💓",
+        "expanded": False,
+        "fields": [
+            {"key": "auto_tachycardia",     "label": "Tachycardia",            "type": "checkbox", "note": "Temporal more than extratemporal"},
+            {"key": "auto_bradycardia",     "label": "Bradycardia / asystole", "type": "checkbox", "note": "Bilateral temporal / orbitofrontal"},
+            {"key": "auto_flushing",        "label": "Flushing",               "type": "checkbox"},
+            {"key": "auto_pallor",          "label": "Pallor",                 "type": "checkbox"},
+            {"key": "auto_piloerection",    "label": "Piloerection",           "type": "checkbox", "note": "Temporal / amygdala"},
+            {"key": "auto_hypersalivation", "label": "Hypersalivation",        "type": "checkbox", "note": "Insulo-opercular"},
+            {"key": "auto_epigastric",      "label": "Epigastric aura",        "type": "checkbox", "note": "Temporal (mesial) → strong TLE marker"},
+            {"key": "auto_vomiting",        "label": "Ictal vomiting",         "type": "checkbox", "note": "Right temporal / insular"},
+            {"key": "auto_spitting",        "label": "Ictal spitting",         "type": "checkbox", "note": "Non-dominant temporal"},
+            {"key": "auto_apnea",           "label": "Ictal apnea",            "type": "checkbox", "note": "Temporal (contralateral spread)"},
+            {"key": "auto_hyperventilation","label": "Ictal hyperventilation", "type": "checkbox"},
+            {"key": "auto_mydriasis",       "label": "Mydriasis",              "type": "checkbox"},
+        ]
+    },
+
+    "sensory_cognitive": {
+        "label": "Sensory & Cognitive Phenomena",
+        "icon": "🧩",
+        "expanded": False,
+        "fields": [
+            {"key": "aura_epigastric",  "label": "Epigastric aura",            "type": "checkbox", "note": "Temporal mesial ~98% when + automatisms"},
+            {"key": "aura_olfactory",   "label": "Olfactory aura",             "type": "checkbox", "note": "Amygdala / piriform / orbitofrontal"},
+            {"key": "aura_gustatory",   "label": "Gustatory aura",             "type": "checkbox", "note": "Insula / peri-rolandic"},
+            {"key": "aura_auditory",    "label": "Auditory aura",              "type": "checkbox", "note": "Superior temporal gyrus"},
+            {"key": "aura_visual",      "label": "Visual aura (elementary)",   "type": "checkbox", "lateralizable": True, "note": "CON when unilateral → occipital"},
+            {"key": "aura_visual_complex","label":"Visual aura (complex)",      "type": "checkbox", "note": "Temporal / parieto-occipital"},
+            {"key": "aura_somatosensory","label":"Somatosensory aura",         "type": "checkbox", "lateralizable": True, "note": "CON → primary somatosensory cortex"},
+            {"key": "aura_vestibular",  "label": "Vestibular / dizziness",     "type": "checkbox", "note": "Parieto-perisylvian"},
+            {"key": "aura_deja_vu",     "label": "Déjà vu / Jamais vu",        "type": "checkbox", "note": "Temporal mesial (amygdala/hippocampus)"},
+            {"key": "aura_fear",        "label": "Ictal fear / panic",         "type": "checkbox", "note": "Temporal mesial (amygdala) / orbitofrontal"},
+            {"key": "aura_ecstatic",    "label": "Ecstatic / blissful feeling","type": "checkbox", "note": "Anterior dorsal insula"},
+            {"key": "ictal_aphasia",    "label": "Ictal aphasia",              "type": "checkbox", "lateralizable": True, "note": "Dominant hemisphere"},
+            {"key": "forced_thinking",  "label": "Forced thinking",            "type": "checkbox", "note": "Dominant frontal"},
+        ]
+    },
+
+    "postictal": {
+        "label": "Postictal Phenomena",
+        "icon": "🌙",
+        "expanded": False,
+        "fields": [
+            {"key": "postictal_unresponsive",   "label": "Postictal unresponsiveness", "type": "checkbox"},
+            {"key": "postictal_nose_wipe",      "label": "Nose wiping",                "type": "checkbox", "lateralizable": True, "note": "IPSI in TLE (86.5%)"},
+            {"key": "postictal_aphasia",        "label": "Postictal language dysfunction","type":"checkbox","lateralizable":True,"note":"Dominant hemisphere"},
+            {"key": "postictal_todd",           "label": "Todd's paresis",             "type": "checkbox", "lateralizable": True, "note": "CON to onset"},
+            {"key": "postictal_blindness",      "label": "Postictal blindness",        "type": "checkbox", "lateralizable": True, "note": "CON → occipital"},
+            {"key": "postictal_headache",       "label": "Postictal headache",         "type": "checkbox", "lateralizable": True, "note": "IPSI in TLE (90%)"},
+            {"key": "postictal_psychiatric",    "label": "Postictal psychiatric signs", "type": "checkbox"},
+            {"key": "postictal_hyperpnea",      "label": "Postictal hyperpnea",        "type": "checkbox", "note": "Supports ES over PNES"},
+            {"key": "postictal_cough",          "label": "Postictal coughing",         "type": "checkbox", "note": "Temporal (with stereotyped semiology)"},
+        ]
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════
+# JSON EXPORT
+# ══════════════════════════════════════════════════════════
+def build_annotation_record(
+    patient_id: str,
+    seizure_num: int,
+    annotator: str,
+    video_name: str,
+    fps: float,
+    total_frames: int,
+    annotations: dict
+) -> dict:
+    """
+    Build a structured JSON record for training data export.
+    Follows ILAE 2022 semiology taxonomy.
+    """
+
+    def frame_to_sec(f):
+        return round(f / fps, 3) if fps > 0 else None
+
+    # Extract phase markers
+    phases = {}
+    for phase_key in ["pre_ictal", "ictal_onset", "mid_ictal", "post_ictal"]:
+        frame_val = annotations.get(phase_key)
+        if frame_val is not None:
+            phases[phase_key] = {
+                "frame": frame_val,
+                "time_sec": frame_to_sec(frame_val)
+            }
+
+    # Derive ictal duration
+    onset_sec = phases.get("ictal_onset", {}).get("time_sec")
+    offset_sec = phases.get("post_ictal", {}).get("time_sec")
+    duration_sec = round(offset_sec - onset_sec, 2) if (onset_sec and offset_sec) else None
+
+    # Collect active ILAE features
+    def collect_section(prefix):
+        result = {}
+        for k, v in annotations.items():
+            if k.startswith(f"{prefix}__"):
+                field = k[len(prefix)+2:]
+                if v and v not in ["—", "— select —", False]:
+                    result[field] = v
+        return result
+
+    # Motor lateralization map
+    lateralization_map = {}
+    for k, v in annotations.items():
+        if k.endswith("__lat") and v:
+            motor_feature = k.replace("__lat", "").split("__")[-1]
+            lateralization_map[motor_feature] = v
+
+    record = {
+        "record_id": f"{patient_id}_sz{seizure_num:02d}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "metadata": {
+            "patient_id": patient_id,
+            "seizure_number": seizure_num,
+            "annotator": annotator,
+            "annotation_timestamp": datetime.now().isoformat(),
+            "video_filename": video_name,
+            "video_fps": fps,
+            "video_total_frames": total_frames,
+            "tool_version": "NeuroAnnotate 1.0",
+            "ilae_reference": "Beniczky et al., Epileptic Disorders 2022"
+        },
+        "diagnosis": {
+            "seizure_type": annotations.get("diagnosis"),
+            "es_subtype": annotations.get("es_type"),
+            "localization": annotations.get("localization"),
+            "lateralization": annotations.get("lateralization"),
+            "annotation_confidence": annotations.get("confidence", "High")
+        },
+        "ictal_phases": phases,
+        "ictal_duration_sec": duration_sec,
+        "semiology": {
+            "consciousness": collect_section("consciousness"),
+            "elementary_motor": collect_section("elementary_motor"),
+            "complex_motor": collect_section("complex_motor"),
+            "oculomotor_gaze": collect_section("oculomotor"),
+            "pnes_features": collect_section("pnes_features"),
+            "autonomic": collect_section("autonomic"),
+            "sensory_cognitive": collect_section("sensory_cognitive"),
+            "postictal": collect_section("postictal"),
+        },
+        "lateralization_map": lateralization_map,
+        "clinical_notes": annotations.get("clinical_notes", ""),
+
+        # Derived feature flags for ML
+        "ml_features": derive_ml_features(annotations)
+    }
+
+    return record
+
+
+def derive_ml_features(ann: dict) -> dict:
+    """
+    Pre-computed binary feature vector for ML classifier input.
+    These are the key discriminating features from ILAE literature.
+    """
+
+    def has(key):
+        return bool(ann.get(key, False))
+
+    pnes_score = sum([
+        has("pnes_features__pnes_gradual_onset"),
+        has("pnes_features__pnes_prolonged"),
+        has("pnes_features__pnes_waxing_waning"),
+        has("pnes_features__pnes_eye_closure"),
+        has("pnes_features__pnes_pelvic_thrust"),
+        has("pnes_features__pnes_opisthotonus"),
+        has("pnes_features__pnes_side_to_side"),
+        has("pnes_features__pnes_asynchronous"),
+    ])
+
+    es_score = sum([
+        has("consciousness__awareness_impaired"),
+        has("elementary_motor__tonic_unilateral"),
+        has("elementary_motor__versive"),
+        has("elementary_motor__figure_of_four"),
+        has("elementary_motor__fencing_posture"),
+        has("elementary_motor__dystonic_posturing"),
+        has("complex_motor__automatisms_oral"),
+        has("oculomotor__gaze_deviation"),
+        has("autonomic__auto_epigastric"),
+        has("postictal__postictal_nose_wipe"),
+        has("postictal__postictal_todd"),
+    ])
+
+    temporal_features = sum([
+        has("complex_motor__automatisms_oral"),
+        has("complex_motor__automatisms_distal"),
+        has("sensory_cognitive__aura_deja_vu"),
+        has("sensory_cognitive__aura_epigastric"),
+        has("sensory_cognitive__aura_fear"),
+        has("autonomic__auto_epigastric"),
+        has("postictal__postictal_nose_wipe"),
+    ])
+
+    frontal_features = sum([
+        has("complex_motor__hyperkinetic"),
+        has("elementary_motor__fencing_posture"),
+        has("elementary_motor__chapeau_gendarme"),
+        has("elementary_motor__tonic_bilateral_asym"),
+        has("complex_motor__automatisms_vocal"),
+    ])
+
+    return {
+        "pnes_feature_count": pnes_score,
+        "es_feature_count": es_score,
+        "temporal_feature_count": temporal_features,
+        "frontal_feature_count": frontal_features,
+        "has_lateralizing_sign": any([
+            has("elementary_motor__versive"),
+            has("elementary_motor__figure_of_four"),
+            has("elementary_motor__fencing_posture"),
+            has("elementary_motor__dystonic_posturing"),
+            has("elementary_motor__asymm_clonic_ending"),
+            has("oculomotor__gaze_deviation"),
+            has("postictal__postictal_todd"),
+            has("postictal__postictal_nose_wipe"),
+        ]),
+        "has_pnes_marker": pnes_score >= 2,
+        "has_oculomotor_sign": any([
+            has("oculomotor__gaze_deviation"),
+            has("oculomotor__eye_closure_forceful"),
+            has("oculomotor__upward_gaze"),
+        ]),
+        "awareness_preserved": has("consciousness__awareness_intact"),
+        "awareness_impaired": has("consciousness__awareness_impaired"),
+    }
+
+
+# ══════════════════════════════════════════════════════════
+# GAZE OVERLAY
+# ══════════════════════════════════════════════════════════
+MODEL_DIR = Path.home() / ".neuro_annotate_models"
+MODEL_URL = "https://github.com/PINTO0309/gazelle-dinov3/releases/download/v1.0.0/gazelle_dinov3_vitb.onnx"
+MODEL_PATH = MODEL_DIR / "gazelle_dinov3_vitb.onnx"
+
+
+class GazeOverlay:
+    """
+    Wraps gazelle-dinov3 ONNX model for gaze estimation.
+    Draws heatmap overlay and gaze point on video frames.
+    """
+
+    def __init__(self):
+        self.session = None
+        self.input_name = None
+        self.input_size = (448, 448)
+        self._load_model()
+
+    def _load_model(self):
+        """Load ONNX model, download if not present."""
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise RuntimeError(
+                "onnxruntime not installed. Run: pip install onnxruntime"
+            )
+
+        if not MODEL_PATH.exists():
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            print(f"Downloading gazelle-dinov3 model to {MODEL_PATH}...")
+            try:
+                urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+                print("Model downloaded successfully.")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not download model: {e}\n"
+                    f"Please manually download from {MODEL_URL} to {MODEL_PATH}"
+                )
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        try:
+            self.session = ort.InferenceSession(str(MODEL_PATH), providers=providers)
+        except Exception:
+            self.session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
+
+        self.input_name = self.session.get_inputs()[0].name
+        print(f"gazelle-dinov3 loaded: {MODEL_PATH.name}")
+
+    def _preprocess(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """Preprocess frame for model input."""
+        h, w = frame_rgb.shape[:2]
+        img = cv2.resize(frame_rgb, self.input_size)
+        img = img.astype(np.float32) / 255.0
+        # ImageNet normalization
+        mean = np.array([0.485, 0.456, 0.406])
+        std  = np.array([0.229, 0.224, 0.225])
+        img = (img - mean) / std
+        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
+        img = np.expand_dims(img, 0)         # → NCHW
+        return img.astype(np.float32)
+
+    def _postprocess(self, output: np.ndarray, frame_shape: tuple):
+        """Convert model output heatmap to gaze point."""
+        heatmap = output[0, 0] if output.ndim == 4 else output[0]
+        heatmap = np.clip(heatmap, 0, None)
+
+        # Normalize heatmap
+        if heatmap.max() > 0:
+            heatmap_norm = heatmap / heatmap.max()
+        else:
+            heatmap_norm = heatmap
+
+        # Find gaze point (weighted centroid of top 10% heatmap)
+        threshold = np.percentile(heatmap_norm, 90)
+        mask = heatmap_norm > threshold
+        if mask.any():
+            ys, xs = np.where(mask)
+            weights = heatmap_norm[mask]
+            gx = float(np.average(xs, weights=weights)) / heatmap.shape[1]
+            gy = float(np.average(ys, weights=weights)) / heatmap.shape[0]
+        else:
+            gx, gy = 0.5, 0.5
+
+        # Check if gaze is likely in-frame (heatmap peak not at borders)
+        border = 0.1
+        in_frame = (border < gx < 1 - border) and (border < gy < 1 - border)
+
+        return {
+            "x": gx,
+            "y": gy,
+            "in_frame": in_frame,
+            "heatmap": heatmap_norm,
+            "deviation_x": (gx - 0.5) * 2,  # -1 = left, +1 = right
+        }
+
+    def process_frame(self, frame_rgb: np.ndarray) -> dict:
+        """
+        Run gaze estimation on a frame.
+        Returns annotated frame + gaze metadata.
+        """
+        if self.session is None:
+            return {"frame": frame_rgb, "gaze_info": {}}
+
+        h, w = frame_rgb.shape[:2]
+        inp = self._preprocess(frame_rgb)
+
+        try:
+            outputs = self.session.run(None, {self.input_name: inp})
+            gaze = self._postprocess(outputs[0], frame_rgb.shape)
+        except Exception as e:
+            return {"frame": frame_rgb, "gaze_info": {}, "error": str(e)}
+
+        # Draw overlay
+        annotated = frame_rgb.copy()
+        annotated = self._draw_overlay(annotated, gaze)
+
+        return {"frame": annotated, "gaze_info": gaze}
+
+    def _draw_overlay(self, frame: np.ndarray, gaze: dict) -> np.ndarray:
+        """Draw gaze heatmap and point on frame."""
+        h, w = frame.shape[:2]
+
+        # Resize heatmap to frame
+        heatmap_resized = cv2.resize(gaze["heatmap"], (w, h))
+        heatmap_colored = cv2.applyColorMap(
+            (heatmap_resized * 255).astype(np.uint8),
+            cv2.COLORMAP_JET
+        )
+        heatmap_colored_rgb = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+
+        # Blend heatmap with frame (low alpha for subtlety)
+        alpha = 0.35
+        frame = cv2.addWeighted(frame, 1 - alpha, heatmap_colored_rgb, alpha, 0)
+
+        # Draw gaze point
+        gx_px = int(gaze["x"] * w)
+        gy_px = int(gaze["y"] * h)
+        color = (88, 200, 100) if gaze["in_frame"] else (247, 129, 102)
+
+        cv2.circle(frame, (gx_px, gy_px), 14, color, 2)
+        cv2.circle(frame, (gx_px, gy_px), 3, color, -1)
+
+        # Deviation line from center
+        cx = w // 2
+        cv2.line(frame, (cx, gy_px), (gx_px, gy_px), color, 1)
+
+        # Label
+        label = f"GAZE {'IN' if gaze['in_frame'] else 'OUT'} | dev={gaze['deviation_x']:+.2f}"
+        cv2.rectangle(frame, (8, 8), (len(label) * 8 + 16, 28), (0, 0, 0), -1)
+        cv2.putText(frame, label, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return frame
+
+
+class MockGazeOverlay:
+    """
+    Mock overlay for development/demo when model is not available.
+    Simulates gaze output with synthetic movement.
+    """
+
+    def __init__(self):
+        self._frame_count = 0
+        print("Using MockGazeOverlay (no model loaded)")
+
+    def process_frame(self, frame_rgb: np.ndarray) -> dict:
+        self._frame_count += 1
+        t = self._frame_count / 30.0
+
+        # Simulate slow gaze drift
+        gx = 0.5 + 0.15 * np.sin(t * 0.5)
+        gy = 0.5 + 0.08 * np.cos(t * 0.3)
+        in_frame = True
+
+        gaze = {
+            "x": gx, "y": gy,
+            "in_frame": in_frame,
+            "deviation_x": (gx - 0.5) * 2,
+            "heatmap": np.zeros((64, 64))
+        }
+
+        h, w = frame_rgb.shape[:2]
+        annotated = frame_rgb.copy()
+        gx_px = int(gx * w)
+        gy_px = int(gy * h)
+        color = (88, 200, 100)
+        cv2.circle(annotated, (gx_px, gy_px), 14, color, 2)
+        cv2.circle(annotated, (gx_px, gy_px), 3, color, -1)
+        cv2.putText(annotated, "MOCK GAZE", (12, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return {
+            "frame": annotated,
+            "gaze_info": gaze
+        }
+
+
+# ══════════════════════════════════════════════════════════
+# MAIN APP
+# ══════════════════════════════════════════════════════════
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="NeuroAnnotate",
