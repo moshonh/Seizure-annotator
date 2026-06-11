@@ -15,6 +15,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 import base64
+import urllib.request
 
 # ══════════════════════════════════════════════════════════
 # ILAE SCHEMA (Beniczky et al. 2022)
