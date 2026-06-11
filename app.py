@@ -349,202 +349,180 @@ def derive_ml_features(ann: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# GAZE OVERLAY
+# PATIENT DETECTION OVERLAY (OpenCV — no download required)
 # ══════════════════════════════════════════════════════════
-MODEL_DIR = Path.home() / ".neuro_annotate_models"
-MODEL_URL = "https://github.com/PINTO0309/gazelle-dinov3/releases/download/v1.0.0/gazelle_dinov3_vitb.onnx"
-MODEL_PATH = MODEL_DIR / "gazelle_dinov3_vitb.onnx"
-
 
 class GazeOverlay:
     """
-    Wraps gazelle-dinov3 ONNX model for gaze estimation.
-    Draws heatmap overlay and gaze point on video frames.
+    Patient detection overlay using OpenCV Haar cascades.
+    Detects: face, eyes, gaze direction estimate.
+    No model download required — uses cascades built into opencv.
     """
 
     def __init__(self):
-        self.session = None
-        self.input_name = None
-        self.input_size = (448, 448)
-        self._load_model()
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.eye_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_eye.xml')
+        self.left_eye_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_lefteye_2splits.xml')
+        self.right_eye_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_righteye_2splits.xml')
+        self._prev_gaze_x = 0.5
+        print("Patient detection overlay loaded (OpenCV Haar cascades)")
 
-    def _load_model(self):
-        """Load ONNX model, download if not present."""
-        try:
-            import onnxruntime as ort
-        except ImportError:
-            raise RuntimeError(
-                "onnxruntime not installed. Run: pip install onnxruntime"
-            )
+    def _estimate_iris(self, eye_roi_gray):
+        """Estimate iris center using thresholding + contours."""
+        if eye_roi_gray.size == 0:
+            return None
+        # Blur and threshold to find darkest region (pupil/iris)
+        blurred = cv2.GaussianBlur(eye_roi_gray, (7, 7), 0)
+        _, thresh = cv2.threshold(blurred, 50, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        # Largest contour = iris
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) < 10:
+            return None
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            return None
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return (cx, cy)
 
-        if not MODEL_PATH.exists():
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            print(f"Downloading gazelle-dinov3 model to {MODEL_PATH}...")
-            try:
-                urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-                print("Model downloaded successfully.")
-            except Exception as e:
-                raise RuntimeError(
-                    f"Could not download model: {e}\n"
-                    f"Please manually download from {MODEL_URL} to {MODEL_PATH}"
-                )
-
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        try:
-            self.session = ort.InferenceSession(str(MODEL_PATH), providers=providers)
-        except Exception:
-            self.session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
-
-        self.input_name = self.session.get_inputs()[0].name
-        print(f"gazelle-dinov3 loaded: {MODEL_PATH.name}")
-
-    def _preprocess(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """Preprocess frame for model input."""
-        h, w = frame_rgb.shape[:2]
-        img = cv2.resize(frame_rgb, self.input_size)
-        img = img.astype(np.float32) / 255.0
-        # ImageNet normalization
-        mean = np.array([0.485, 0.456, 0.406])
-        std  = np.array([0.229, 0.224, 0.225])
-        img = (img - mean) / std
-        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
-        img = np.expand_dims(img, 0)         # → NCHW
-        return img.astype(np.float32)
-
-    def _postprocess(self, output: np.ndarray, frame_shape: tuple):
-        """Convert model output heatmap to gaze point."""
-        heatmap = output[0, 0] if output.ndim == 4 else output[0]
-        heatmap = np.clip(heatmap, 0, None)
-
-        # Normalize heatmap
-        if heatmap.max() > 0:
-            heatmap_norm = heatmap / heatmap.max()
+    def _gaze_direction(self, eye_roi_gray, eye_rect):
+        """Estimate gaze: left/center/right + deviation score."""
+        iris = self._estimate_iris(eye_roi_gray)
+        if iris is None:
+            return "unknown", 0.0
+        h, w = eye_roi_gray.shape
+        rel_x = iris[0] / w  # 0=left edge, 1=right edge
+        if rel_x < 0.35:
+            direction = "LEFT"
+        elif rel_x > 0.65:
+            direction = "RIGHT"
         else:
-            heatmap_norm = heatmap
-
-        # Find gaze point (weighted centroid of top 10% heatmap)
-        threshold = np.percentile(heatmap_norm, 90)
-        mask = heatmap_norm > threshold
-        if mask.any():
-            ys, xs = np.where(mask)
-            weights = heatmap_norm[mask]
-            gx = float(np.average(xs, weights=weights)) / heatmap.shape[1]
-            gy = float(np.average(ys, weights=weights)) / heatmap.shape[0]
-        else:
-            gx, gy = 0.5, 0.5
-
-        # Check if gaze is likely in-frame (heatmap peak not at borders)
-        border = 0.1
-        in_frame = (border < gx < 1 - border) and (border < gy < 1 - border)
-
-        return {
-            "x": gx,
-            "y": gy,
-            "in_frame": in_frame,
-            "heatmap": heatmap_norm,
-            "deviation_x": (gx - 0.5) * 2,  # -1 = left, +1 = right
-        }
+            direction = "CENTER"
+        deviation = (rel_x - 0.5) * 2  # -1 to +1
+        return direction, deviation
 
     def process_frame(self, frame_rgb: np.ndarray) -> dict:
-        """
-        Run gaze estimation on a frame.
-        Returns annotated frame + gaze metadata.
-        """
-        if self.session is None:
-            return {"frame": frame_rgb, "gaze_info": {}}
-
         h, w = frame_rgb.shape[:2]
-        inp = self._preprocess(frame_rgb)
-
-        try:
-            outputs = self.session.run(None, {self.input_name: inp})
-            gaze = self._postprocess(outputs[0], frame_rgb.shape)
-        except Exception as e:
-            return {"frame": frame_rgb, "gaze_info": {}, "error": str(e)}
-
-        # Draw overlay
         annotated = frame_rgb.copy()
-        annotated = self._draw_overlay(annotated, gaze)
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 
-        return {"frame": annotated, "gaze_info": gaze}
+        gaze_info = {
+            "face_detected": False,
+            "n_eyes": 0,
+            "gaze_direction": "unknown",
+            "deviation_x": 0.0,
+            "in_frame": True,
+            "x": 0.5,
+            "y": 0.5,
+        }
 
-    def _draw_overlay(self, frame: np.ndarray, gaze: dict) -> np.ndarray:
-        """Draw gaze heatmap and point on frame."""
-        h, w = frame.shape[:2]
+        # ── Detect face ──────────────────────────────────────
+        faces = self.face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
-        # Resize heatmap to frame
-        heatmap_resized = cv2.resize(gaze["heatmap"], (w, h))
-        heatmap_colored = cv2.applyColorMap(
-            (heatmap_resized * 255).astype(np.uint8),
-            cv2.COLORMAP_JET
-        )
-        heatmap_colored_rgb = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        if len(faces) == 0:
+            # Try profile face
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
 
-        # Blend heatmap with frame (low alpha for subtlety)
-        alpha = 0.35
-        frame = cv2.addWeighted(frame, 1 - alpha, heatmap_colored_rgb, alpha, 0)
+        if len(faces) > 0:
+            # Use largest face
+            fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+            gaze_info["face_detected"] = True
+            gaze_info["x"] = (fx + fw / 2) / w
+            gaze_info["y"] = (fy + fh / 2) / h
 
-        # Draw gaze point
-        gx_px = int(gaze["x"] * w)
-        gy_px = int(gaze["y"] * h)
-        color = (88, 200, 100) if gaze["in_frame"] else (247, 129, 102)
+            # Draw face box
+            cv2.rectangle(annotated, (fx, fy), (fx+fw, fy+fh),
+                          (88, 200, 100), 2)
+            cv2.putText(annotated, "PATIENT", (fx, fy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 200, 100), 1)
 
-        cv2.circle(frame, (gx_px, gy_px), 14, color, 2)
-        cv2.circle(frame, (gx_px, gy_px), 3, color, -1)
+            # ── Detect eyes within face ROI ──────────────────
+            face_gray = gray[fy:fy+fh, fx:fx+fw]
+            face_rgb_roi = annotated[fy:fy+fh, fx:fx+fw]
 
-        # Deviation line from center
-        cx = w // 2
-        cv2.line(frame, (cx, gy_px), (gx_px, gy_px), color, 1)
+            # Use upper half of face for eyes
+            upper = face_gray[:fh//2, :]
+            eyes = self.eye_cascade.detectMultiScale(
+                upper, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
 
-        # Label
-        label = f"GAZE {'IN' if gaze['in_frame'] else 'OUT'} | dev={gaze['deviation_x']:+.2f}"
-        cv2.rectangle(frame, (8, 8), (len(label) * 8 + 16, 28), (0, 0, 0), -1)
-        cv2.putText(frame, label, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            gaze_info["n_eyes"] = len(eyes)
+            deviations = []
 
-        return frame
+            for (ex, ey, ew, eh) in eyes[:2]:
+                # Draw eye box
+                cv2.rectangle(face_rgb_roi,
+                              (ex, ey), (ex+ew, ey+eh),
+                              (88, 166, 255), 1)
+
+                # Iris detection
+                eye_gray = upper[ey:ey+eh, ex:ex+ew]
+                iris = self._estimate_iris(eye_gray)
+                if iris is not None:
+                    ix_abs = fx + ex + iris[0]
+                    iy_abs = fy + ey + iris[1]
+                    cv2.circle(annotated, (ix_abs, iy_abs), 4, (255, 220, 50), -1)
+                    # Deviation
+                    dev = (iris[0] / ew - 0.5) * 2
+                    deviations.append(dev)
+
+            if deviations:
+                mean_dev = float(np.mean(deviations))
+                gaze_info["deviation_x"] = mean_dev
+                if mean_dev < -0.3:
+                    gaze_info["gaze_direction"] = "LEFT"
+                elif mean_dev > 0.3:
+                    gaze_info["gaze_direction"] = "RIGHT"
+                else:
+                    gaze_info["gaze_direction"] = "CENTER"
+                self._prev_gaze_x = mean_dev
+
+        # ── HUD overlay ──────────────────────────────────────
+        face_str  = "FACE: ✓" if gaze_info["face_detected"] else "FACE: ✗"
+        eyes_str  = f"EYES: {gaze_info['n_eyes']}"
+        gaze_str  = f"GAZE: {gaze_info['gaze_direction']}"
+        dev_str   = f"DEV: {gaze_info['deviation_x']:+.2f}"
+
+        face_col = (88, 200, 100) if gaze_info["face_detected"] else (247, 129, 102)
+        eye_col  = (88, 166, 255) if gaze_info["n_eyes"] > 0 else (247, 129, 102)
+        gaze_col = (255, 220, 50)
+
+        # Semi-transparent HUD bar
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 36), (0, 0, 0), -1)
+        annotated = cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0)
+
+        cv2.putText(annotated, face_str, (8,  24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_col, 1)
+        cv2.putText(annotated, eyes_str, (120, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, eye_col,  1)
+        cv2.putText(annotated, gaze_str, (210, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gaze_col, 1)
+        cv2.putText(annotated, dev_str,  (330, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gaze_col, 1)
+
+        # Gaze deviation arrow from center
+        if gaze_info["face_detected"] and gaze_info["n_eyes"] > 0:
+            cx = w // 2
+            cy = 50
+            arrow_len = int(gaze_info["deviation_x"] * 80)
+            cv2.arrowedLine(annotated, (cx, cy), (cx + arrow_len, cy),
+                            gaze_col, 2, tipLength=0.3)
+
+        return {"frame": annotated, "gaze_info": gaze_info}
 
 
 class MockGazeOverlay:
-    """
-    Mock overlay for development/demo when model is not available.
-    Simulates gaze output with synthetic movement.
-    """
-
     def __init__(self):
         self._frame_count = 0
-        print("Using MockGazeOverlay (no model loaded)")
 
-    def process_frame(self, frame_rgb: np.ndarray) -> dict:
+    def process_frame(self, frame_rgb):
         self._frame_count += 1
-        t = self._frame_count / 30.0
-
-        # Simulate slow gaze drift
-        gx = 0.5 + 0.15 * np.sin(t * 0.5)
-        gy = 0.5 + 0.08 * np.cos(t * 0.3)
-        in_frame = True
-
-        gaze = {
-            "x": gx, "y": gy,
-            "in_frame": in_frame,
-            "deviation_x": (gx - 0.5) * 2,
-            "heatmap": np.zeros((64, 64))
-        }
-
-        h, w = frame_rgb.shape[:2]
-        annotated = frame_rgb.copy()
-        gx_px = int(gx * w)
-        gy_px = int(gy * h)
-        color = (88, 200, 100)
-        cv2.circle(annotated, (gx_px, gy_px), 14, color, 2)
-        cv2.circle(annotated, (gx_px, gy_px), 3, color, -1)
-        cv2.putText(annotated, "MOCK GAZE", (12, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-        return {
-            "frame": annotated,
-            "gaze_info": gaze
-        }
-
+        return {"frame": frame_rgb, "gaze_info": {}}
 
 # ══════════════════════════════════════════════════════════
 # MAIN APP
