@@ -3,7 +3,9 @@ NeuroAnnotate — Ictal Semiology Annotation Tool
 Rambam Medical Center Epilepsy Service
 Based on: Beniczky et al., ILAE Glossary of Seizure Semiology, Epileptic Disorders 2022
 """
-
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import streamlit as st
 import cv2
 import numpy as np
